@@ -6,9 +6,11 @@ use teloxide::{
     dispatching::dialogue::{GetChatId, InMemStorage},
     payloads::SendMessageSetters,
     prelude::*,
+    sugar::bot::BotMessagesExt,
     types::{
-        ButtonRequest::Location, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
-        KeyboardMarkup,
+        ButtonRequest::Location, InlineKeyboardButton, InlineKeyboardMarkup,
+        InlineQueryResultArticle, InputMessageContent, InputMessageContentText, KeyboardButton,
+        KeyboardMarkup, KeyboardRemove,
     },
     utils::command::BotCommands,
 };
@@ -20,19 +22,18 @@ pub enum State {
     Start,
     RecieveLanguage,
     RecieveStyle {
-        language: &'static str,
+        language: String,
     },
     RecieveLocation {
-        language: &'static str,
+        language: String,
         style: Style,
     },
     WaitForTask {
-        language: &'static str,
+        language: String,
         style: Style,
         timezone: String,
-    },
-    // Создать напоминание
-    //
+    }, // Создать напоминание
+       //
 }
 
 // /// These commands are supported:
@@ -46,18 +47,10 @@ pub enum State {
 // }
 // Процес создания напоминаний
 // Создать
-// Через сколько дней:
-// Какого числа:
+// Написать через сколько дней:
+// Написать Какого числа:
 
-#[derive(Clone, Copy)]
-struct User {
-    id: ChatId,
-    lang: &'static str,
-    style: Style,
-    is_premium: bool,
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Style {
     prompt_path: &'static str,
     premium: bool,
@@ -82,8 +75,8 @@ struct StyleDict {
 }
 
 impl StyleDict {
-    fn get_vec_by_lang(self, lang: &str) -> Vec<String> {
-        let styles_by_lang = match lang {
+    fn get_vec_by_lang(self, lang: &String) -> Vec<String> {
+        let styles_by_lang = match lang.as_str() {
             "ru" => self.ru,
             "en" => self.en,
             "by" => self.by,
@@ -101,8 +94,8 @@ impl StyleDict {
 struct Language;
 
 impl Language {
-    fn from_str(str: &str) -> &'static str {
-        match str {
+    fn from_str(str: &str) -> String {
+        let lang = match str {
             "Русский" => "ru",
             "English" => "en",
             "Беларускі" => "by",
@@ -110,7 +103,8 @@ impl Language {
                 "Unknown language pass! Pls provide something better than {}",
                 str
             ),
-        }
+        };
+        lang.into()
     }
 
     fn get_vec() -> Vec<String> {
@@ -201,7 +195,8 @@ pub async fn run() {
                     timezone
                 }]
                 .branch(Update::filter_callback_query().endpoint(filter_buttons))
-                .branch(Update::filter_message().endpoint(filter_messages)),
+                .branch(Update::filter_message().endpoint(filter_messages))
+                .branch(Update::filter_inline_query().endpoint(filter_inline)),
             ),
     );
 
@@ -225,10 +220,10 @@ async fn start(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResult {
 async fn receive_lang(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResult {
     if let Some(text) = msg.text() {
         if Language::is_supported(&text.to_owned()) {
-            let language: &str = Language::from_str(text);
+            let language = Language::from_str(text);
             let msg_to_send: &str;
 
-            match language {
+            match language.as_str() {
                 "ru" => {
                     msg_to_send = "Прекрасно, какой стиль напоминаний предпочитаете?";
                 }
@@ -244,14 +239,16 @@ async fn receive_lang(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerRe
                 _ => panic!("Impossible error"),
             }
 
-            let keyboard = make_keyboard(STYLES_LANG.get_vec_by_lang(language), 3);
+            let keyboard = make_keyboard(STYLES_LANG.get_vec_by_lang(&language), 3);
 
             bot.send_message(msg.chat.id, msg_to_send)
                 .reply_markup(keyboard)
                 .await?;
 
             dialogue
-                .update(State::RecieveStyle { language: language })
+                .update(State::RecieveStyle {
+                    language: language.to_string(),
+                })
                 .await?;
         } else {
             bot.send_message(msg.chat.id, "⌨️⌨️⌨️⌨️👇👇👇🤦🤦").await?;
@@ -265,7 +262,7 @@ async fn receive_lang(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerRe
 async fn receive_style(
     bot: Bot,
     dialogue: MyDialogue,
-    language: &'static str,
+    language: String,
     msg: Message,
 ) -> HandlerResult {
     match msg.text() {
@@ -275,7 +272,7 @@ async fn receive_style(
                 .iter()
                 .find(|style_elem| style.contains(style_elem.emoji));
             if let Some(result) = result {
-                let msg_to_send: &str = match language {
+                let msg_to_send: &str = match language.as_str() {
                     "ru" => {
                         "Теперь попрошу вас прислать геопозицию для точного присылания напоминаний. Нажмите на кнопочку ниже"
                     }
@@ -318,7 +315,7 @@ async fn receive_style(
 async fn receive_location(
     bot: Bot,
     dialogue: MyDialogue,
-    (language, style): (&'static str, Style),
+    (language, style): (String, Style),
     msg: Message,
     finder: Arc<DefaultFinder>,
 ) -> HandlerResult {
@@ -326,14 +323,20 @@ async fn receive_location(
         let lat = location.latitude;
         let lon = location.longitude;
         let timezone = finder.get_tz_name(lon, lat).to_string();
-        let msg_to_send = match language {
-            "ru" => format!("Часовой пояс установлен для {timezone}!"),
-            "en" => format!("Time zone set to {timezone}!"),
-            "by" => format!("Гадзінны пояс установленны на {timezone}!"),
+        let msg_to_send = match language.as_str() {
+            "ru" => format!(
+                "Часовой пояс установлен для {timezone}!\n\nВсё готово! Пользуйтесь кнопками ниже."
+            ),
+            "en" => format!("Time zone set to {timezone}!\n\nAll done! Use buttons below."),
+            "by" => format!(
+                "Гадзінны пояс установленны на {timezone}!\n\nУсё гатова! Карыстайцеся кнопкамі ніжэй"
+            ),
             _ => panic!("Impossible error "),
         };
 
-        let keyboard = make_keyboard(MAIN_BUTTONS.get_vec_by_lang(language), 1);
+        //let opt
+
+        let keyboard = make_keyboard(MAIN_BUTTONS.get_vec_by_lang(&language), 1);
 
         bot.send_message(msg.chat.id, msg_to_send)
             .reply_markup(keyboard)
@@ -353,11 +356,43 @@ async fn receive_location(
     Ok(())
 }
 
-async fn wait_for_task(
+async fn filter_inline(bot: Bot, q: InlineQuery) -> HandlerResult {
+    let choose_debian_version = InlineQueryResultArticle::new(
+        "0",
+        "Chose debian version",
+        InputMessageContent::Text(InputMessageContentText::new("Debian versions:")),
+    )
+    .reply_markup(make_keyboard());
+
+    bot.answer_inline_query(q.id, vec![choose_debian_version.into()])
+        .await?;
+
+    Ok(())
+}
+
+async fn filter_buttons(
     bot: Bot,
     dialogue: MyDialogue,
-    (language, style, timezone): (&'static str, Style, String),
     msg: Message,
+    q: CallbackQuery,
+    (language, style, timezone): (String, Style, String),
+) -> HandlerResult {
+    bot.answer_callback_query(q.id.clone()).await?;
+
+    if let (Some(data), Some(msg)) = (&q.data, &q.regular_message()) {
+        match data.as_str() {
+            "today" => bot.edit_text(msg, "ha"),
+            _ => panic!(),
+        };
+    };
+    Ok(())
+}
+
+async fn filter_messages(
+    bot: Bot,
+    dialogue: MyDialogue,
+    msg: Message,
+    (language, style, timezone): (String, Style, String),
 ) -> HandlerResult {
     if let Some(text) = msg.text() {
         let button = MAIN_BUTTONS
@@ -369,15 +404,33 @@ async fn wait_for_task(
             match button.prompt_path {
                 // На самом деле это не промпт а просто действия, не хочу сравнивать по эмодзи, это не удобно
                 "new" => {
-                    let msg_to_send: &str = match language {
-                        "ru" => "Когда придёт напоминание?",
-                        "en" => "When reminder will come to you?",
-                        "by" => "Калі прыдзе ваш напамінак?",
+                    let msg_to_send: &str;
+                    let vector_names: Vec<&str>;
+                    let vector_data: Vec<&str> = vec!["today", "other_day", "some_date"];
+                    match language.as_str() {
+                        "ru" => {
+                            msg_to_send = "Когда придёт напоминание?";
+                            vector_names = vec!["Сегодня", "Через пару дней", "Какого-то числа"]
+                        }
+                        "en" => {
+                            msg_to_send = "When reminder will come to you?";
+                            vector_names = vec!["Today", "Days later", "In some exact date"]
+                        }
+                        "by" => {
+                            msg_to_send = "Калі прыдзе ваш напамінак?";
+                            vector_names = vec!["Сягодня", "Праз пару дзён", "Нейкага чысла"]
+                        }
                         _ => panic!("impossible error"),
                     };
 
+                    // Через пару дней
+                    //
+
+                    let keyboard = make_inline_keyboard(vector_names, vector_data, 1);
+
                     bot.send_message(msg.chat.id, msg_to_send)
-                        //.reply_markup()
+                        .reply_markup(KeyboardRemove::new())
+                        .reply_markup(keyboard)
                         .await?;
                 }
                 "manage" => {}
@@ -385,27 +438,6 @@ async fn wait_for_task(
                 _ => panic!("impossible error"),
             }
         }
-    }
-    Ok(())
-}
-
-async fn filter_buttons(
-    bot: Bot,
-    dialogue: MyDialogue,
-    (language, style, timezone): (&'static str, Style, String),
-    msg: Message,
-) -> HandlerResult {
-    Ok(())
-}
-
-async fn filter_messages(
-    bot: Bot,
-    dialogue: MyDialogue,
-    (language, style, timezone): (&'static str, Style, String),
-    msg: Message,
-) -> HandlerResult {
-    if let Some(text) = msg.text() {
-        bot.send_message(msg.chat.id, "succes numba2").await?;
     }
     Ok(())
 }
