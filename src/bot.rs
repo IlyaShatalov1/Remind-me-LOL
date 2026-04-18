@@ -1,9 +1,10 @@
-type MyDialogue = Dialogue<State, InMemStorage<State>>;
-type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-use std::{panic, sync::Arc};
+use serde::{Deserialize, Serialize};
+use std::{panic, str::FromStr, sync::Arc};
 use teloxide::{
-    dispatching::dialogue::{GetChatId, InMemStorage},
+    dispatching::dialogue::{
+        ErasedStorage, GetChatId, InMemStorage, SqliteStorage, Storage, serializer::Json,
+    },
+    dptree::case,
     payloads::SendMessageSetters,
     prelude::*,
     sugar::bot::BotMessagesExt,
@@ -16,7 +17,24 @@ use teloxide::{
 };
 use tzf_rs::DefaultFinder; // Использует встроенные данные
 
-#[derive(Clone, Default)]
+use sqlx::{
+    FromRow,
+    sqlite::{SqliteConnectOptions, SqliteExecutor, SqlitePool},
+};
+
+type MyDialogue = Dialogue<State, ErasedStorage<State>>;
+type MyStorage = Arc<ErasedStorage<State>>;
+type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+#[derive(Clone, sqlx::FromRow)]
+pub struct UserSettings {
+    pub chat_id: i64,
+    pub timezone: String,
+    pub style_path: String,
+    pub language: String,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub enum State {
     #[default]
     Start,
@@ -26,29 +44,11 @@ pub enum State {
     },
     RecieveLocation {
         language: String,
-        style: Style,
+        style_path: String,
     },
-    WaitForTask {
-        language: String,
-        style: Style,
-        timezone: String,
-    }, // Создать напоминание
-       //
+    WaitForTask,
+    CreateReminder,
 }
-
-// /// These commands are supported:
-// #[derive(BotCommands)]
-// #[command(rename_rule = "lowercase")]
-// enum Command {
-//     /// Display this text
-//     Help,
-//     /// Start
-//     Start,
-// }
-// Процес создания напоминаний
-// Создать
-// Написать через сколько дней:
-// Написать Какого числа:
 
 #[derive(Clone)]
 struct Style {
@@ -173,39 +173,106 @@ const STYLES_LANG: StyleDict = StyleDict {
 
 pub async fn run() {
     pretty_env_logger::init();
-    log::info!("Starting buttons bot...");
+    log::info!("Starting bot...");
 
     let bot = Bot::from_env();
     let finder = Arc::new(DefaultFinder::new());
 
-    let handler = dptree::entry().branch(
-        Update::filter_message()
-            .enter_dialogue::<Message, InMemStorage<State>, State>()
-            .branch(dptree::case![State::Start].endpoint(start))
-            .branch(dptree::case![State::RecieveLanguage].endpoint(receive_lang))
-            .branch(dptree::case![State::RecieveStyle { language }].endpoint(receive_style))
-            .branch(
-                dptree::case![State::RecieveLocation { language, style }]
+    let options = SqliteConnectOptions::from_str("sqlite://databases/users_info.db")
+        .expect("SQLite connection options failed")
+        .create_if_missing(true);
+
+    let pool = SqlitePool::connect_with(options)
+        .await
+        .expect("Pool didnt created successfully");
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS users (
+                chat_id INTEGER PRIMARY KEY,
+                language TEXT NOT NULL,
+                style_path TEXT NOT NULL,
+                timezone TEXT NOT NULL
+            )",
+    )
+    .execute(&pool)
+    .await
+    .expect("Coudnt create db table");
+
+    let storage: MyStorage = SqliteStorage::open("databases/users_state.db", Json)
+        .await
+        .expect("cant open users_state.db")
+        .erase();
+
+    let handler = dptree::entry()
+        .branch(
+            Update::filter_callback_query()
+                .enter_dialogue::<CallbackQuery, ErasedStorage<State>, State>()
+                .chain(dptree::filter_map_async(fetch_user_settings_callback))
+                .endpoint(filter_buttons),
+        )
+        .branch(
+            Update::filter_message()
+                .enter_dialogue::<Message, ErasedStorage<State>, State>()
+                .branch(case![State::Start].endpoint(start))
+                .branch(case![State::RecieveLanguage].endpoint(receive_lang))
+                .branch(case![State::RecieveStyle { language }].endpoint(receive_style))
+                .branch(
+                    case![State::RecieveLocation {
+                        language,
+                        style_path
+                    }]
                     .endpoint(receive_location),
-            )
-            .branch(
-                dptree::case![State::WaitForTask {
-                    language,
-                    style,
-                    timezone
-                }]
-                .branch(Update::filter_callback_query().endpoint(filter_buttons))
-                .branch(Update::filter_message().endpoint(filter_messages))
-                .branch(Update::filter_inline_query().endpoint(filter_inline)),
-            ),
-    );
+                )
+                .branch(
+                    case![State::WaitForTask]
+                        .chain(dptree::filter_map_async(fetch_user_settings_message))
+                        .endpoint(wait_for_task),
+                ),
+        );
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![InMemStorage::<State>::new(), finder])
+        .dependencies(dptree::deps![storage, finder, pool])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
         .await;
+}
+
+async fn fetch_user_settings_callback(pool: SqlitePool, q: CallbackQuery) -> Option<UserSettings> {
+    let chat_id = q.from.id.0 as i64;
+
+    let settings_row = sqlx::query("SELECT * FROM users WHERE chat_id = ?")
+        .bind(chat_id)
+        .fetch_one(&pool)
+        .await;
+
+    match settings_row {
+        Ok(row) => {
+            log::info!("got user settings for chat_id: {}", chat_id);
+            Some(UserSettings::from_row(&row).expect("coudnt take user settings from row"))
+        }
+        Err(_) => None,
+    }
+}
+
+async fn fetch_user_settings_message(
+    pool: SqlitePool,
+    dialogue: MyDialogue,
+) -> Option<UserSettings> {
+    let chat_id = dialogue.chat_id().0;
+
+    let settings_row = sqlx::query("SELECT * FROM users WHERE chat_id = ?")
+        .bind(chat_id)
+        .fetch_one(&pool)
+        .await;
+
+    match settings_row {
+        Ok(row) => {
+            log::info!("got user settings for chat_id: {}", chat_id);
+            Some(UserSettings::from_row(&row).expect("coudnt take user settings from row"))
+        }
+        Err(_) => None,
+    }
 }
 
 async fn start(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResult {
@@ -297,7 +364,7 @@ async fn receive_style(
                 dialogue
                     .update(State::RecieveLocation {
                         language,
-                        style: result.to_owned(),
+                        style_path: result.prompt_path.to_owned(),
                     })
                     .await?;
             } else {
@@ -315,9 +382,10 @@ async fn receive_style(
 async fn receive_location(
     bot: Bot,
     dialogue: MyDialogue,
-    (language, style): (String, Style),
+    (language, style_path): (String, String),
     msg: Message,
     finder: Arc<DefaultFinder>,
+    pool: SqlitePool,
 ) -> HandlerResult {
     if let Some(location) = msg.location() {
         let lat = location.latitude;
@@ -331,10 +399,8 @@ async fn receive_location(
             "by" => format!(
                 "Гадзінны пояс установленны на {timezone}!\n\nУсё гатова! Карыстайцеся кнопкамі ніжэй"
             ),
-            _ => panic!("Impossible error "),
+            _ => panic!("Impossible error"),
         };
-
-        //let opt
 
         let keyboard = make_keyboard(MAIN_BUTTONS.get_vec_by_lang(&language), 1);
 
@@ -342,13 +408,23 @@ async fn receive_location(
             .reply_markup(keyboard)
             .await?;
 
-        dialogue
-            .update(State::WaitForTask {
-                language,
-                style,
-                timezone,
-            })
-            .await?;
+        sqlx::query(
+            "INSERT INTO users (chat_id, language, style_path, timezone)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT(chat_id) DO UPDATE SET
+               language = excluded.language,
+               style_path = excluded.style_path,
+               timezone = excluded.timezone",
+        )
+        .bind(msg.chat.id.0)
+        .bind(language)
+        .bind(style_path)
+        .bind(timezone)
+        .execute(&pool)
+        .await?;
+
+        dialogue.update(State::WaitForTask).await?;
+        log::info!("Updating to wait_for_task");
     } else {
         bot.send_message(msg.chat.id, "⌨️⌨️⌨️⌨️👇👇👇🤦🤦").await?;
     }
@@ -356,43 +432,47 @@ async fn receive_location(
     Ok(())
 }
 
-async fn filter_inline(bot: Bot, q: InlineQuery) -> HandlerResult {
-    let choose_debian_version = InlineQueryResultArticle::new(
-        "0",
-        "Chose debian version",
-        InputMessageContent::Text(InputMessageContentText::new("Debian versions:")),
-    )
-    .reply_markup(make_keyboard());
-
-    bot.answer_inline_query(q.id, vec![choose_debian_version.into()])
-        .await?;
-
-    Ok(())
-}
-
 async fn filter_buttons(
     bot: Bot,
-    dialogue: MyDialogue,
-    msg: Message,
     q: CallbackQuery,
-    (language, style, timezone): (String, Style, String),
+    dialogue: MyDialogue,
+    settings: UserSettings,
+    state: State,
 ) -> HandlerResult {
-    bot.answer_callback_query(q.id.clone()).await?;
+    match state {
+        State::WaitForTask => {
+            if let Some(data) = q.data.as_ref() {
+                let text = format!("{}", settings.language);
+                match data.as_str() {
+                    "today" => {}
+                    _ => {}
+                }
 
-    if let (Some(data), Some(msg)) = (&q.data, &q.regular_message()) {
-        match data.as_str() {
-            "today" => bot.edit_text(msg, "ha"),
-            _ => panic!(),
-        };
-    };
+                // Tell telegram that we've seen this query, to remove 🕑 icons from the
+                // clients. You could also use `answer_callback_query`'s optional
+                // parameters to tweak what happens on the client side.
+                bot.answer_callback_query(q.id.clone()).await?;
+
+                // Edit text of the message to which the buttons were attached
+                if let Some(message) = q.regular_message() {
+                    bot.edit_text(message, text).await?;
+                } else if let Some(id) = q.inline_message_id {
+                    bot.edit_message_text_inline(id, text).await?;
+                }
+
+                log::info!("You chose: {data}");
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
-async fn filter_messages(
+async fn wait_for_task(
     bot: Bot,
     dialogue: MyDialogue,
     msg: Message,
-    (language, style, timezone): (String, Style, String),
+    settings: UserSettings,
 ) -> HandlerResult {
     if let Some(text) = msg.text() {
         let button = MAIN_BUTTONS
@@ -407,7 +487,7 @@ async fn filter_messages(
                     let msg_to_send: &str;
                     let vector_names: Vec<&str>;
                     let vector_data: Vec<&str> = vec!["today", "other_day", "some_date"];
-                    match language.as_str() {
+                    match settings.language.as_str() {
                         "ru" => {
                             msg_to_send = "Когда придёт напоминание?";
                             vector_names = vec!["Сегодня", "Через пару дней", "Какого-то числа"]
@@ -427,7 +507,6 @@ async fn filter_messages(
                     //
 
                     let keyboard = make_inline_keyboard(vector_names, vector_data, 1);
-
                     bot.send_message(msg.chat.id, msg_to_send)
                         .reply_markup(KeyboardRemove::new())
                         .reply_markup(keyboard)
@@ -450,13 +529,20 @@ fn make_inline_keyboard(
 ) -> InlineKeyboardMarkup {
     let mut keyboard: Vec<Vec<InlineKeyboardButton>> = vec![];
 
-    for elements in vector_names.chunks(chunks) {
-        let row = elements
-            .iter()
-            .zip(&vector_data)
-            .map(|(name, data)| InlineKeyboardButton::callback(name.to_owned(), data.to_owned()))
-            .collect();
+    // 1. Собираем пары (имя, данные) в промежуточный вектор
+    let combined: Vec<_> = vector_names.iter().zip(vector_data.iter()).collect();
 
+    // 2. Итерируемся по кускам (строкам клавиатуры)
+    for chunk in combined.chunks(chunks) {
+        let row = chunk
+            .iter()
+            .map(|(name, data)| {
+                // 3. Создаем кнопку (клонируем строки для callback_data)
+                InlineKeyboardButton::callback(name.to_string(), data.to_string())
+            })
+            .collect::<Vec<InlineKeyboardButton>>();
+
+        // 4. Добавляем строку в общую разметку
         keyboard.push(row);
     }
 
