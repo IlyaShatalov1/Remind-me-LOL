@@ -1,42 +1,41 @@
 use serde::{Deserialize, Serialize};
 use std::{panic, str::FromStr, sync::Arc};
 use teloxide::{
-    dispatching::dialogue::{
-        ErasedStorage, GetChatId, InMemStorage, SqliteStorage, Storage, serializer::Json,
-    },
+    dispatching::dialogue::{ErasedStorage, SqliteStorage, Storage, serializer::Json},
     dptree::case,
     payloads::SendMessageSetters,
     prelude::*,
     sugar::bot::BotMessagesExt,
-    types::{
-        ButtonRequest::Location, InlineKeyboardButton, InlineKeyboardMarkup,
-        InlineQueryResultArticle, InputMessageContent, InputMessageContentText, KeyboardButton,
-        KeyboardMarkup, KeyboardRemove,
-    },
-    utils::command::BotCommands,
+    types::KeyboardRemove,
 };
 use tzf_rs::DefaultFinder; // Использует встроенные данные
 
 use sqlx::{
     FromRow,
-    sqlite::{SqliteConnectOptions, SqliteExecutor, SqlitePool},
+    sqlite::{SqliteConnectOptions, SqlitePool},
 };
 
-type MyDialogue = Dialogue<State, ErasedStorage<State>>;
-type MyStorage = Arc<ErasedStorage<State>>;
-type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+use crate::{
+    get_user_info::{Language, MAIN_BUTTONS, receive_lang, receive_location, receive_style},
+    utils::{make_inline_keyboard, make_keyboard},
+};
 
-#[derive(Clone, sqlx::FromRow)]
+pub type MyDialogue = Dialogue<State, ErasedStorage<State>>;
+pub type MyStorage = Arc<ErasedStorage<State>>;
+pub type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+#[derive(Clone, sqlx::FromRow, Serialize, Deserialize)]
 pub struct UserSettings {
-    pub chat_id: i64,
     pub timezone: String,
     pub style_path: String,
     pub language: String,
+    pub chat_id: i64,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub enum State {
     #[default]
+    // Gettings user info
     Start,
     RecieveLanguage,
     RecieveStyle {
@@ -46,130 +45,29 @@ pub enum State {
         language: String,
         style_path: String,
     },
-    WaitForTask,
-    CreateReminder,
+
+    WaitForTask {
+        user_settings: UserSettings,
+    }, // Waiting for user to select a task
+
+    // Creating reminder
+    CreateReminder {
+        user_settings: UserSettings,
+    },
+    RecieveReminderDate {
+        user_settings: UserSettings,
+        exact_date: bool,
+    },
+    RecieveReminderTime {
+        user_settings: UserSettings,
+        date: String,
+    },
+    RecieveAdditionalInfo {
+        user_settings: UserSettings,
+        date: String,
+        time: String,
+    },
 }
-
-#[derive(Clone)]
-struct Style {
-    prompt_path: &'static str,
-    premium: bool,
-    emoji: &'static str,
-}
-
-impl Style {
-    fn get_by_emoji(self, text: &str) -> Style {
-        if text.contains(self.emoji) {
-            return self;
-        } else {
-            panic!("Trying to find style when there arent");
-        }
-    }
-}
-
-struct StyleDict {
-    ru: &'static [&'static str],
-    en: &'static [&'static str],
-    by: &'static [&'static str],
-    styles: &'static [Style],
-}
-
-impl StyleDict {
-    fn get_vec_by_lang(self, lang: &String) -> Vec<String> {
-        let styles_by_lang = match lang.as_str() {
-            "ru" => self.ru,
-            "en" => self.en,
-            "by" => self.by,
-            _ => panic!("Unsupported language: {}", lang),
-        };
-
-        self.styles
-            .iter()
-            .zip(styles_by_lang)
-            .map(|(style, style_name)| format!("{} {}", style.emoji, style_name))
-            .collect()
-    }
-}
-
-struct Language;
-
-impl Language {
-    fn from_str(str: &str) -> String {
-        let lang = match str {
-            "Русский" => "ru",
-            "English" => "en",
-            "Беларускі" => "by",
-            _ => panic!(
-                "Unknown language pass! Pls provide something better than {}",
-                str
-            ),
-        };
-        lang.into()
-    }
-
-    fn get_vec() -> Vec<String> {
-        vec![
-            "Русский".to_owned(),
-            "English".to_owned(),
-            "Беларускі".to_owned(),
-        ]
-    }
-
-    fn is_supported(text: &str) -> bool {
-        Language::get_vec().contains(&text.to_owned())
-    }
-}
-
-// Не знаю норм ли так оставлять но шо работает то работает
-const MAIN_BUTTONS: StyleDict = StyleDict {
-    ru: &[
-        "Новое напоминание",
-        "Настроить Напоминания",
-        "Купить премиум",
-    ],
-    en: &["New reminder", "Manage reminders", "Buy premium"],
-    by: &["Новы напамін", "Наладзіць напамінкі", "Купіць прэміум"],
-    styles: &[
-        Style {
-            prompt_path: "new",
-            emoji: "🆕",
-            premium: false,
-        },
-        Style {
-            prompt_path: "manage",
-            emoji: "⚙️",
-            premium: false,
-        },
-        Style {
-            prompt_path: "premium",
-            emoji: "🌟",
-            premium: false,
-        },
-    ],
-};
-
-const STYLES_LANG: StyleDict = StyleDict {
-    ru: &["Злой тролль", "Аниме гик", "Церковный"],
-    en: &["Angry troll", "Anime geek", "Churchly"],
-    by: &["Злы троль", "Анімэ гік", "Царкоўны"],
-    styles: &[
-        Style {
-            prompt_path: "promts/angry_troll.txt",
-            emoji: "🤬",
-            premium: false,
-        },
-        Style {
-            prompt_path: "prompts/anime_geek.txt",
-            emoji: "🇯🇵",
-            premium: false,
-        },
-        Style {
-            prompt_path: "prompts/churchly.txt",
-            emoji: "🕯️",
-            premium: false,
-        },
-    ],
-};
 
 pub async fn run() {
     pretty_env_logger::init();
@@ -207,7 +105,7 @@ pub async fn run() {
         .branch(
             Update::filter_callback_query()
                 .enter_dialogue::<CallbackQuery, ErasedStorage<State>, State>()
-                .chain(dptree::filter_map_async(fetch_user_settings_callback))
+                //.chain(dptree::filter_map_async(fetch_user_settings_callback))
                 .endpoint(filter_buttons),
         )
         .branch(
@@ -224,10 +122,11 @@ pub async fn run() {
                     .endpoint(receive_location),
                 )
                 .branch(
-                    case![State::WaitForTask]
-                        .chain(dptree::filter_map_async(fetch_user_settings_message))
+                    case![State::WaitForTask { user_settings }]
+                        //.chain(dptree::filter_map_async(fetch_user_settings_message))
                         .endpoint(wait_for_task),
-                ),
+                )
+                .branch(case![State::CreateReminder { user_settings }].endpoint(create_reminder)),
         );
 
     Dispatcher::builder(bot, handler)
@@ -238,22 +137,22 @@ pub async fn run() {
         .await;
 }
 
-async fn fetch_user_settings_callback(pool: SqlitePool, q: CallbackQuery) -> Option<UserSettings> {
-    let chat_id = q.from.id.0 as i64;
+// async fn fetch_user_settings_callback(pool: SqlitePool, q: CallbackQuery) -> Option<UserSettings> {
+//     let chat_id = q.from.id.0 as i64;
 
-    let settings_row = sqlx::query("SELECT * FROM users WHERE chat_id = ?")
-        .bind(chat_id)
-        .fetch_one(&pool)
-        .await;
+//     let settings_row = sqlx::query("SELECT * FROM users WHERE chat_id = ?")
+//         .bind(chat_id)
+//         .fetch_one(&pool)
+//         .await;
 
-    match settings_row {
-        Ok(row) => {
-            log::info!("got user settings for chat_id: {}", chat_id);
-            Some(UserSettings::from_row(&row).expect("coudnt take user settings from row"))
-        }
-        Err(_) => None,
-    }
-}
+//     match settings_row {
+//         Ok(row) => {
+//             log::info!("got user settings for chat_id: {}", chat_id);
+//             Some(UserSettings::from_row(&row).expect("coudnt take user settings from row"))
+//         }
+//         Err(_) => None,
+//     }
+// }
 
 async fn fetch_user_settings_message(
     pool: SqlitePool,
@@ -284,183 +183,79 @@ async fn start(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResult {
     Ok(())
 }
 
-async fn receive_lang(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResult {
-    if let Some(text) = msg.text() {
-        if Language::is_supported(&text.to_owned()) {
-            let language = Language::from_str(text);
-            let msg_to_send: &str;
-
-            match language.as_str() {
-                "ru" => {
-                    msg_to_send = "Прекрасно, какой стиль напоминаний предпочитаете?";
-                }
-                "en" => {
-                    msg_to_send = "Nice, what style do you prefer more?";
-                }
-                "by" => {
-                    msg_to_send =
-                        "Гэта цудоўна, але, штучны інтэллект патрымлівае нашу мову вельмі дрэнна.
-                        \nКарыстуйцеся на сваю рызыку.
-                        \nЯкі стыль спадабаецца больш?";
-                }
-                _ => panic!("Impossible error"),
-            }
-
-            let keyboard = make_keyboard(STYLES_LANG.get_vec_by_lang(&language), 3);
-
-            bot.send_message(msg.chat.id, msg_to_send)
-                .reply_markup(keyboard)
-                .await?;
-
-            dialogue
-                .update(State::RecieveStyle {
-                    language: language.to_string(),
-                })
-                .await?;
-        } else {
-            bot.send_message(msg.chat.id, "⌨️⌨️⌨️⌨️👇👇👇🤦🤦").await?;
-        }
-    } else {
-        bot.send_message(msg.chat.id, "⌨️⌨️⌨️⌨️👇👇👇🤦🤦").await?;
-    }
-    Ok(())
-}
-
-async fn receive_style(
-    bot: Bot,
-    dialogue: MyDialogue,
-    language: String,
-    msg: Message,
-) -> HandlerResult {
-    match msg.text() {
-        Some(style) => {
-            let result = STYLES_LANG
-                .styles
-                .iter()
-                .find(|style_elem| style.contains(style_elem.emoji));
-            if let Some(result) = result {
-                let msg_to_send: &str = match language.as_str() {
-                    "ru" => {
-                        "Теперь попрошу вас прислать геопозицию для точного присылания напоминаний. Нажмите на кнопочку ниже"
-                    }
-                    "en" => {
-                        "Now I want to ask you geolocation for proper reminder sending. Press the button below"
-                    }
-                    "by" => {
-                        "Цяпер я хачу запрасіць вашу геалакацыю для дакладнага адпраўлення напамінкаў. Націсніце на кнопку ніжэй"
-                    }
-                    _ => panic!("Impossible error"),
-                };
-
-                let geo_button = KeyboardButton::new("📍").request(Location);
-                let keyboard = KeyboardMarkup::new(vec![vec![geo_button]])
-                    .one_time_keyboard()
-                    .resize_keyboard();
-
-                bot.send_message(msg.chat.id, msg_to_send)
-                    .reply_markup(keyboard)
-                    .await?;
-
-                dialogue
-                    .update(State::RecieveLocation {
-                        language,
-                        style_path: result.prompt_path.to_owned(),
-                    })
-                    .await?;
-            } else {
-                bot.send_message(msg.chat.id, "⌨️⌨️⌨️⌨️👇👇👇🤦🤦").await?;
-            }
-        }
-        _ => {
-            bot.send_message(msg.chat.id, "⌨️⌨️⌨️⌨️👇👇👇🤦🤦").await?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn receive_location(
-    bot: Bot,
-    dialogue: MyDialogue,
-    (language, style_path): (String, String),
-    msg: Message,
-    finder: Arc<DefaultFinder>,
-    pool: SqlitePool,
-) -> HandlerResult {
-    if let Some(location) = msg.location() {
-        let lat = location.latitude;
-        let lon = location.longitude;
-        let timezone = finder.get_tz_name(lon, lat).to_string();
-        let msg_to_send = match language.as_str() {
-            "ru" => format!(
-                "Часовой пояс установлен для {timezone}!\n\nВсё готово! Пользуйтесь кнопками ниже."
-            ),
-            "en" => format!("Time zone set to {timezone}!\n\nAll done! Use buttons below."),
-            "by" => format!(
-                "Гадзінны пояс установленны на {timezone}!\n\nУсё гатова! Карыстайцеся кнопкамі ніжэй"
-            ),
-            _ => panic!("Impossible error"),
-        };
-
-        let keyboard = make_keyboard(MAIN_BUTTONS.get_vec_by_lang(&language), 1);
-
-        bot.send_message(msg.chat.id, msg_to_send)
-            .reply_markup(keyboard)
-            .await?;
-
-        sqlx::query(
-            "INSERT INTO users (chat_id, language, style_path, timezone)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT(chat_id) DO UPDATE SET
-               language = excluded.language,
-               style_path = excluded.style_path,
-               timezone = excluded.timezone",
-        )
-        .bind(msg.chat.id.0)
-        .bind(language)
-        .bind(style_path)
-        .bind(timezone)
-        .execute(&pool)
-        .await?;
-
-        dialogue.update(State::WaitForTask).await?;
-        log::info!("Updating to wait_for_task");
-    } else {
-        bot.send_message(msg.chat.id, "⌨️⌨️⌨️⌨️👇👇👇🤦🤦").await?;
-    }
-
-    Ok(())
-}
-
 async fn filter_buttons(
     bot: Bot,
     q: CallbackQuery,
     dialogue: MyDialogue,
-    settings: UserSettings,
     state: State,
 ) -> HandlerResult {
     match state {
-        State::WaitForTask => {
+        State::CreateReminder { user_settings } => {
             if let Some(data) = q.data.as_ref() {
-                let text = format!("{}", settings.language);
                 match data.as_str() {
-                    "today" => {}
+                    "today" => {
+                        let text = match user_settings.language.as_str() {
+                            "en" => {
+                                "Write your reminder time in the format Hour:Minute (only 24-hour format allowed!)"
+                            }
+                            "ru" => "Напишите время для напоминания в виде Час:Минута",
+                            "by" => "Напішыце час для напамінка ў фармату Гадзіна:Мінута",
+                            _ => "This should not happen, please report this issue",
+                        };
+
+                        if let Some(message) = q.regular_message() {
+                            bot.edit_text(message, text).await?;
+                        } else if let Some(id) = q.inline_message_id {
+                            bot.edit_message_text_inline(id, text).await?;
+                        }
+
+                        dialogue
+                            .update(State::RecieveReminderTime {
+                                user_settings: user_settings,
+                                date: chrono::Local::now().date_naive().to_string(),
+                            })
+                            .await?
+                    }
+                    "other_day" => {
+                        let text = match user_settings.language.as_str() {
+                            "en" => "Write in how many days the reminder will arrive.",
+                            "ru" => "Напишите через сколько дней должно прийти напоминание.",
+                            "by" => "Напішыце праз колькі дзён прыдзе напамінак.",
+                            _ => "This should not happen, please report this issue",
+                        };
+
+                        if let Some(message) = q.regular_message() {
+                            bot.edit_text(message, text).await?;
+                        } else if let Some(id) = q.inline_message_id {
+                            bot.edit_message_text_inline(id, text).await?;
+                        }
+
+                        dialogue
+                            .update(State::RecieveReminderDate {
+                                user_settings: user_settings,
+                                exact_date: false,
+                            })
+                            .await?
+                    }
+                    "some_day" => {
+                        let text = "Напиши дату в формате день";
+                        if let Some(message) = q.regular_message() {
+                            bot.edit_text(message, text).await?;
+                        } else if let Some(id) = q.inline_message_id {
+                            bot.edit_message_text_inline(id, text).await?;
+                        }
+
+                        dialogue
+                            .update(State::RecieveReminderDate {
+                                user_settings: user_settings,
+                                exact_date: true,
+                            })
+                            .await?
+                    }
                     _ => {}
                 }
 
-                // Tell telegram that we've seen this query, to remove 🕑 icons from the
-                // clients. You could also use `answer_callback_query`'s optional
-                // parameters to tweak what happens on the client side.
                 bot.answer_callback_query(q.id.clone()).await?;
-
-                // Edit text of the message to which the buttons were attached
-                if let Some(message) = q.regular_message() {
-                    bot.edit_text(message, text).await?;
-                } else if let Some(id) = q.inline_message_id {
-                    bot.edit_message_text_inline(id, text).await?;
-                }
-
-                log::info!("You chose: {data}");
             }
         }
         _ => {}
@@ -503,14 +298,16 @@ async fn wait_for_task(
                         _ => panic!("impossible error"),
                     };
 
-                    // Через пару дней
-                    //
-
                     let keyboard = make_inline_keyboard(vector_names, vector_data, 1);
                     bot.send_message(msg.chat.id, msg_to_send)
-                        .reply_markup(KeyboardRemove::new())
                         .reply_markup(keyboard)
                         .await?;
+
+                    dialogue
+                        .update(State::CreateReminder {
+                            user_settings: settings,
+                        })
+                        .await?
                 }
                 "manage" => {}
                 "premium" => {}
@@ -521,48 +318,39 @@ async fn wait_for_task(
     Ok(())
 }
 
-// Creates a keyboard made by buttons in a big column.
-fn make_inline_keyboard(
-    vector_names: Vec<&str>,
-    vector_data: Vec<&str>,
-    chunks: usize,
-) -> InlineKeyboardMarkup {
-    let mut keyboard: Vec<Vec<InlineKeyboardButton>> = vec![];
-
-    // 1. Собираем пары (имя, данные) в промежуточный вектор
-    let combined: Vec<_> = vector_names.iter().zip(vector_data.iter()).collect();
-
-    // 2. Итерируемся по кускам (строкам клавиатуры)
-    for chunk in combined.chunks(chunks) {
-        let row = chunk
-            .iter()
-            .map(|(name, data)| {
-                // 3. Создаем кнопку (клонируем строки для callback_data)
-                InlineKeyboardButton::callback(name.to_string(), data.to_string())
-            })
-            .collect::<Vec<InlineKeyboardButton>>();
-
-        // 4. Добавляем строку в общую разметку
-        keyboard.push(row);
-    }
-
-    InlineKeyboardMarkup::new(keyboard)
+async fn recieve_reminder_time(
+    bot: Bot,
+    dialogue: MyDialogue,
+    msg: Message,
+    user_settings: UserSettings,
+    date: String,
+) -> HandlerResult {
+    if let Some(text) = msg.text() {}
+    Ok(())
 }
 
-fn make_keyboard(vector: Vec<String>, chunks: usize) -> KeyboardMarkup {
-    let mut keyboard: Vec<Vec<KeyboardButton>> = vec![];
+async fn create_reminder(
+    bot: Bot,
+    dialogue: MyDialogue,
+    msg: Message,
+    user_settings: UserSettings,
+) -> HandlerResult {
+    Ok(())
+}
 
-    for elements in vector.chunks(chunks) {
-        let row = elements
-            .iter()
-            .map(|element| KeyboardButton::new(element))
-            .collect();
-
-        keyboard.push(row);
+async fn recieve_reminder_date(
+    bot: Bot,
+    dialogue: MyDialogue,
+    msg: Message,
+    user_settings: UserSettings,
+    exact_date: bool,
+) -> HandlerResult {
+    if let Some(text) = msg.text() {
+        if exact_date {
+        } else {
+        }
     }
-
-    KeyboardMarkup::new(keyboard).resize_keyboard()
-    //.one_time_keyboard()
+    Ok(())
 }
 
 // Какие же стили

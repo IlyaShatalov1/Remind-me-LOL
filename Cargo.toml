@@ -13,12 +13,8 @@ chrono = "0.4.44"
 chrono-tz = "0.10.4"
 sqlx = { version = "0.8", features = [ "runtime-tokio", "tls-native-tls", "sqlite", "macros" ] }
 serde = "1.0.228"
+regex = "1.12.3"
 
 [profile.release]
-codegen-units = 256 # Максимально дробим код для параллельной работы LLVM
-incremental = true   # Включает инкрементальную сборку (в релизе по дефолту выключена)
-
-
-[target.x86_64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-Clink-arg=--ld-path=wild"]
+codegen-units = 256
+incremental = true
