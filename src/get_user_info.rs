@@ -22,7 +22,7 @@ pub struct Style {
 impl Style {
     pub fn get_by_emoji(self, text: &str) -> Style {
         if text.contains(self.emoji) {
-            return self;
+            self
         } else {
             panic!("Trying to find style when there arent");
         }
@@ -83,25 +83,25 @@ impl Language {
 }
 
 pub const STYLES_LANG: StyleDict = StyleDict {
-    ru: &["Злой тролль", "Аниме гик", "Церковный"],
-    en: &["Angry troll", "Anime geek", "Churchly"],
-    by: &["Злы троль", "Анімэ гік", "Царкоўны"],
+    ru: &["Злой тролль"], // "Аниме гик", "Церковный" TODO: Добавить в будущем
+    en: &["Angry troll"], // "Anime geek", "Churchly"
+    by: &["Злы троль"],   // "Анімэ гік", "Царкоўны"
     styles: &[
         Style {
-            prompt_path: "promts/angry_troll.txt",
+            prompt_path: "prompts/angry.txt",
             emoji: "🤬",
             premium: false,
         },
-        Style {
-            prompt_path: "prompts/anime_geek.txt",
-            emoji: "🇯🇵",
-            premium: false,
-        },
-        Style {
-            prompt_path: "prompts/churchly.txt",
-            emoji: "🕯️",
-            premium: false,
-        },
+        // Style {
+        //     prompt_path: "prompts/anime_geek.txt",
+        //     emoji: "🇯🇵",
+        //     premium: false,
+        // },
+        // Style {
+        //     prompt_path: "prompts/churchly.txt",
+        //     emoji: "🕯️",
+        //     premium: false,
+        // },
     ],
 };
 
@@ -144,7 +144,7 @@ pub async fn start(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResul
 
 pub async fn receive_lang(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResult {
     if let Some(text) = msg.text() {
-        if Language::is_supported(&text.to_owned()) {
+        if Language::is_supported(text) {
             let language = Language::from_str(text);
             let msg_to_send: &str;
 
@@ -243,7 +243,6 @@ pub async fn receive_location(
     (language, style_path): (String, String),
     msg: Message,
     finder: Arc<DefaultFinder>,
-    pool: SqlitePool,
 ) -> HandlerResult {
     if let Some(location) = msg.location() {
         let lat = location.latitude;
@@ -272,21 +271,6 @@ pub async fn receive_location(
             style_path,
             timezone,
         };
-
-        sqlx::query(
-            "INSERT INTO users (chat_id, language, style_path, timezone)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT(chat_id) DO UPDATE SET
-               language = excluded.language,
-               style_path = excluded.style_path,
-               timezone = excluded.timezone",
-        )
-        .bind(&user_settings.chat_id)
-        .bind(user_settings.language.clone())
-        .bind(user_settings.style_path.clone())
-        .bind(user_settings.timezone.clone())
-        .execute(&pool)
-        .await?;
 
         dialogue
             .update(State::WaitForTask { user_settings })

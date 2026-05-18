@@ -32,10 +32,7 @@ pub fn make_keyboard(vector: Vec<String>, chunks: usize) -> KeyboardMarkup {
     let mut keyboard: Vec<Vec<KeyboardButton>> = vec![];
 
     for elements in vector.chunks(chunks) {
-        let row = elements
-            .iter()
-            .map(|element| KeyboardButton::new(element))
-            .collect();
+        let row = elements.iter().map(KeyboardButton::new).collect();
 
         keyboard.push(row);
     }

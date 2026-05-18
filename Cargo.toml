@@ -14,7 +14,27 @@ chrono-tz = "0.10.4"
 sqlx = { version = "0.8", features = [ "runtime-tokio", "tls-native-tls", "sqlite", "macros" ] }
 serde = "1.0.228"
 regex = "1.12.3"
+clap = "4.6.1"
+serde_json = "1.0.149"
+reqwest = {version = "0.13.3", features = ["json"]}
+dotenvy = "0.15.7"
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+codegen-units = 256
+lto = false
+
+# Опционально: Оптимизация зависимостей в режиме dev
+# Ваши зависимости будут компилироваться один раз, но быстро.
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
-codegen-units = 256
-incremental = true
+opt-level = 3
+debug = false
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = "symbols"
